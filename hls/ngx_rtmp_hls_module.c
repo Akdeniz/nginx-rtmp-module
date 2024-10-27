@@ -28,6 +28,8 @@ static ngx_int_t ngx_rtmp_hls_flush_audio(ngx_rtmp_session_t *s);
 static ngx_int_t ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s,
        ngx_str_t *path);
 
+size_t playlist_time_format_length = sizeof("1970-09-28T12:00:00+06:00");
+
 
 #define NGX_RTMP_HLS_BUFSIZE            (1024*1024)
 #define NGX_RTMP_HLS_DIR_ACCESS         0744
@@ -60,6 +62,7 @@ typedef struct {
     ngx_str_t                           stream;
     ngx_str_t                           keyfile;
     ngx_str_t                           name;
+    ngx_str_t                           name_suffix;
     u_char                              key[16];
 
     uint64_t                            frag;
@@ -114,8 +117,12 @@ typedef struct {
     ngx_str_t                           key_path;
     ngx_str_t                           key_url;
     ngx_uint_t                          frags_per_key;
+    ngx_uint_t                          playlist_naming;
 } ngx_rtmp_hls_app_conf_t;
 
+#define NGX_RTMP_HLS_PLAYLIST_NAMING_MINUTE  1
+#define NGX_RTMP_HLS_PLAYLIST_NAMING_HOUR    2
+#define NGX_RTMP_HLS_PLAYLIST_NAMING_DAY     3
 
 #define NGX_RTMP_HLS_NAMING_SEQUENTIAL  1
 #define NGX_RTMP_HLS_NAMING_TIMESTAMP   2
@@ -129,6 +136,12 @@ typedef struct {
 #define NGX_RTMP_HLS_TYPE_LIVE          1
 #define NGX_RTMP_HLS_TYPE_EVENT         2
 
+static ngx_conf_enum_t                  ngx_rtmp_hls_playlist_naming_slots[] = {
+        { ngx_string("minute"),         NGX_RTMP_HLS_PLAYLIST_NAMING_MINUTE },
+        { ngx_string("hour"),          NGX_RTMP_HLS_PLAYLIST_NAMING_HOUR  },
+        { ngx_string("day"),             NGX_RTMP_HLS_PLAYLIST_NAMING_DAY  },
+        { ngx_null_string,                  0 }
+};
 
 static ngx_conf_enum_t                  ngx_rtmp_hls_naming_slots[] = {
     { ngx_string("sequential"),         NGX_RTMP_HLS_NAMING_SEQUENTIAL },
@@ -223,6 +236,13 @@ static ngx_command_t ngx_rtmp_hls_commands[] = {
       NGX_RTMP_APP_CONF_OFFSET,
       offsetof(ngx_rtmp_hls_app_conf_t, naming),
       &ngx_rtmp_hls_naming_slots },
+
+    { ngx_string("hls_playlist_naming"),
+      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_RTMP_APP_CONF_OFFSET,
+      offsetof(ngx_rtmp_hls_app_conf_t, playlist_naming),
+      &ngx_rtmp_hls_playlist_naming_slots },
 
     { ngx_string("hls_fragment_slicing"),
       NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
@@ -479,6 +499,107 @@ ngx_rtmp_hls_write_variant_playlist(ngx_rtmp_session_t *s)
 }
 
 
+static u_char*
+ngx_rtmp_hls_get_playlist_id(ngx_rtmp_session_t *s, u_char* p)
+{
+    ngx_tm_t         gmt;
+    ngx_rtmp_hls_app_conf_t    *hacf;
+
+    hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
+
+    ngx_gmtime(ngx_cached_time->sec, &gmt);
+
+    switch (hacf->playlist_naming) {
+
+        case NGX_RTMP_HLS_PLAYLIST_NAMING_MINUTE:
+            return ngx_sprintf(p, "%4d-%02d-%02dT%02d:%02d:%02d",
+                               gmt.ngx_tm_year,
+                               gmt.ngx_tm_mon,
+                               gmt.ngx_tm_mday, gmt.ngx_tm_hour,
+                               gmt.ngx_tm_min, 0);
+
+        case NGX_RTMP_HLS_PLAYLIST_NAMING_HOUR:
+            return ngx_sprintf(p, "%4d-%02d-%02dT%02d:%02d:%02d",
+                               gmt.ngx_tm_year,
+                               gmt.ngx_tm_mon,
+                               gmt.ngx_tm_mday, gmt.ngx_tm_hour,
+                               0, 0);
+
+        case NGX_RTMP_HLS_PLAYLIST_NAMING_DAY:
+            return ngx_sprintf(p, "%4d-%02d-%02dT%02d:%02d:%02d",
+                               gmt.ngx_tm_year,
+                               gmt.ngx_tm_mon,
+                               gmt.ngx_tm_mday, 0,
+                               0, 0);
+
+        default:
+            return p;
+    }
+}
+
+static bool
+has_playlist_changed(ngx_rtmp_session_t *s)
+{
+    ngx_rtmp_hls_ctx_t             *ctx;
+    u_char                         path[playlist_time_format_length];
+
+    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
+    size_t len = ngx_rtmp_hls_get_playlist_id(s, path) - path;
+
+    return (len != ctx->name_suffix.len || ngx_strncmp(ctx->playlist.data, path, ctx->name_suffix.len)!=0);
+}
+
+static ngx_int_t
+update_playlist_info(ngx_rtmp_session_t *s)
+{
+    ngx_rtmp_hls_app_conf_t        *hacf;
+    ngx_rtmp_hls_ctx_t             *ctx;
+    u_char                         *p;
+
+    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
+    hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
+
+    ctx->name_suffix.len = ngx_rtmp_hls_get_playlist_id(s, ctx->name_suffix.data) - ctx->name_suffix.data;
+
+    p = ngx_cpymem(ctx->playlist.data, hacf->path.data, hacf->path.len);
+
+    if (p[-1] != '/') {
+        *p++ = '/';
+    }
+
+    p = ngx_cpymem(p, ctx->name.data, ctx->name.len);
+    p = ngx_cpymem(p, ctx->name_suffix.data, ctx->name_suffix.len);
+
+    ctx->stream.len = p - ctx->playlist.data + 1;
+
+    ngx_memcpy(ctx->stream.data, ctx->playlist.data, ctx->stream.len - 1);
+    ctx->stream.data[ctx->stream.len - 1] = (hacf->nested ? '/' : '-');
+
+    if (hacf->nested) {
+        p = ngx_cpymem(p, "/index.m3u8", sizeof("/index.m3u8") - 1);
+    } else {
+        p = ngx_cpymem(p, ".m3u8", sizeof(".m3u8") - 1);
+    }
+
+    ctx->playlist.len = p - ctx->playlist.data;
+
+    *p = 0;
+
+    /* playlist bak (new playlist) path */
+
+    ctx->playlist_bak.data = ngx_palloc(s->connection->pool,
+                                        ctx->playlist.len + sizeof(".bak"));
+    p = ngx_cpymem(ctx->playlist_bak.data, ctx->playlist.data,
+                   ctx->playlist.len);
+    p = ngx_cpymem(p, ".bak", sizeof(".bak") - 1);
+
+    ctx->playlist_bak.len = p - ctx->playlist_bak.data;
+
+    *p = 0;
+
+    return 0;
+}
+
 static ngx_int_t
 ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
 {
@@ -493,7 +614,6 @@ ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
     ngx_str_t                       name_part, key_name_part;
     uint64_t                        prev_key_id;
     const char                     *sep, *key_sep;
-
 
     hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
@@ -607,6 +727,12 @@ ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
 
     if (ctx->var) {
         return ngx_rtmp_hls_write_variant_playlist(s);
+    }
+
+    if(has_playlist_changed(s)) {
+        update_playlist_info(s);
+        ngx_rtmp_hls_ensure_directory(s, &hacf->path);
+        ctx->frag = ctx->nfrags = 0;
     }
 
     return NGX_OK;
@@ -789,7 +915,6 @@ ngx_rtmp_hls_append_sps_pps(ngx_rtmp_session_t *s, ngx_buf_t *out)
 
     return NGX_OK;
 }
-
 
 static uint64_t
 ngx_rtmp_hls_get_fragment_id(ngx_rtmp_session_t *s, uint64_t ts)
@@ -1232,8 +1357,8 @@ ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s, ngx_str_t *path)
         return NGX_ERROR;
     }
 
-    ngx_snprintf(zpath, sizeof(zpath) - 1, "%*s/%V%Z", len, path->data,
-                 &ctx->name);
+    ngx_snprintf(zpath, sizeof(zpath) - 1, "%*s/%V%V%Z", len, path->data,
+                 &ctx->name, &ctx->name_suffix);
 
     if (ngx_file_info(zpath, &fi) != NGX_FILE_ERROR) {
 
@@ -1345,6 +1470,7 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
     if (hacf->nested) {
         len += sizeof("/index") - 1;
     }
+    len += playlist_time_format_length; // allocating memory for suffix here
 
     ctx->playlist.data = ngx_palloc(s->connection->pool, len);
     p = ngx_cpymem(ctx->playlist.data, hacf->path.data, hacf->path.len);
@@ -1354,6 +1480,11 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
     }
 
     p = ngx_cpymem(p, ctx->name.data, ctx->name.len);
+
+    ctx->name_suffix.data = ngx_palloc(s->connection->pool, playlist_time_format_length);
+    ctx->name_suffix.len = ngx_rtmp_hls_get_playlist_id(s, ctx->name_suffix.data) - ctx->name_suffix.data;
+    p = ngx_cpymem(p, ctx->name_suffix.data, ctx->name_suffix.len);
+
 
     /*
      * ctx->stream holds initial part of stream file path
@@ -2309,6 +2440,7 @@ ngx_rtmp_hls_create_app_conf(ngx_conf_t *cf)
     conf->granularity = NGX_CONF_UNSET;
     conf->keys = NGX_CONF_UNSET;
     conf->frags_per_key = NGX_CONF_UNSET_UINT;
+    conf->playlist_naming = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
