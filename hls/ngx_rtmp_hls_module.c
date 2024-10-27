@@ -546,7 +546,7 @@ has_playlist_changed(ngx_rtmp_session_t *s)
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
     size_t len = ngx_rtmp_hls_get_playlist_id(s, path) - path;
 
-    return (len != ctx->name_suffix.len || ngx_strncmp(ctx->playlist.data, path, ctx->name_suffix.len)!=0);
+    return (len != ctx->name_suffix.len || ngx_strncmp(ctx->name_suffix.data, path, ctx->name_suffix.len)!=0);
 }
 
 static ngx_int_t
